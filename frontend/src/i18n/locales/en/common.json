@@ -77,13 +77,14 @@
     "deleteConfirmDesc": "Are you sure you want to delete forward config \"{{name}}\"? This cannot be undone."
   },
   "appQuit": {
-    "activityTitle": "Active tasks and sessions remain",
-    "activitySummary": "{{running}} task(s) running and {{connections}} session(s) connected",
+    "activityTitle": "Tasks are still running",
+    "activitySummary": "{{running}} task(s) running, plus {{connections}} connected session(s)",
+    "activitySummaryRunningOnly": "Quitting now interrupts {{running}} running task(s)",
     "runningGroup": "Running · cannot continue after quitting",
     "connectionGroup": "Connected · will be disconnected on quit",
     "runningStatus": "Running",
     "connectedStatus": "Connected",
-    "quitActivities": "Quit and interrupt {{count}} activities",
+    "quitActivities": "Quit and interrupt {{count}} task(s)",
     "aiTask": "AI task {{number}}",
     "opsctlTask": "opsctl task {{number}}",
     "opsctlApproval": "Waiting for desktop approval",

@@ -35,7 +35,7 @@ import { useKeyboardShortcuts } from "@/hooks/useKeyboardShortcuts";
 import { useExternalEditStore } from "@/stores/externalEditStore";
 import { useAIStore } from "@/stores/aiStore";
 import { asset_entity, group_entity } from "../wailsjs/go/models";
-import { EventsOn, WindowToggleMaximise } from "../wailsjs/runtime/runtime";
+import { EventsEmit, EventsOn, WindowToggleMaximise } from "../wailsjs/runtime/runtime";
 import { ConfirmQuit } from "../wailsjs/go/system/System";
 
 function App() {
@@ -65,7 +65,10 @@ function App() {
           }
           return activity;
         });
-        if (activities.length > 0) setQuitActivities(activities);
+        setQuitActivities(activities);
+        // 回执"对话框已接手"：后端在等这条消息，超时拿不到就认为 webview 已经
+        // 弹不出对话框而直接放行退出，避免窗口永远关不掉。
+        EventsEmit("app:quit-confirm-shown");
       }
     );
     return () => cancel();
