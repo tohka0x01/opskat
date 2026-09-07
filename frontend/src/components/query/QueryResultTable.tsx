@@ -81,7 +81,7 @@ interface QueryResultTableProps {
   onAddColumnFilter?: (col: string) => void;
   onRemoveColumnFilter?: (col: string) => void;
   onRemoveAllFilters?: () => void;
-  onDeleteRow?: (rowIdx: number) => void;
+  onDeleteRows?: (rowIdxs: number[]) => void;
   onHideColumn?: (col: string) => void;
   onVisibleColumnToggle?: (col: string) => void;
   onSelectedCellChange?: (cell: SelectedCellContext | null) => void;
@@ -110,10 +110,9 @@ interface QueryResultTableProps {
 // Set so they don't collide with the literal string "null" etc.
 const NULL_KEY = "__opskat_null_sentinel__";
 const DEFAULT_COLUMN_WIDTH = 160;
-
-// 复用同一个空集合,避免"清空选中"每次都产生新引用。
-// 安全的前提:本文件对选中集合一律整体替换,从不原地 add/delete。
-const EMPTY_ROW_SELECTION = new Set<number>();
+const ROW_NUMBER_MIN_WIDTH = 44;
+const ROW_NUMBER_PADDING = 24;
+const ROW_NUMBER_CHAR_WIDTH = 8;
 
 const CONTEXT_MENU_ITEM_CLASS =
   "relative flex w-full cursor-default items-center gap-2 rounded-sm px-2 py-1.5 text-sm outline-hidden select-none hover:bg-accent hover:text-accent-foreground [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4 [&_svg:not([class*='text-'])]:text-muted-foreground";
@@ -254,12 +253,14 @@ function QueryResultTableImpl({
   onAddColumnFilter,
   onRemoveColumnFilter,
   onRemoveAllFilters,
-  onDeleteRow,
+  onDeleteRows,
   onHideColumn,
   onVisibleColumnToggle,
   onSelectedCellChange,
   onSelectedRowsChange,
   onRefresh,
+  showRowNumber,
+  rowNumberOffset = 0,
   sortColumn: controlledSortCol,
   sortDir: controlledSortDir,
   onSortChange,
@@ -367,6 +368,7 @@ function QueryResultTableImpl({
   const [selectedRowIdxs, setSelectedRowIdxs] = useState<Set<number>>(() => new Set());
   const [selectedColumns, setSelectedColumns] = useState<Set<string>>(() => new Set());
   const columnSelectionAnchorRef = useRef<string | null>(null);
+  const rowSelectionAnchorRef = useRef<number | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const [showColumnChooser, setShowColumnChooser] = useState(false);
   const [showFieldTypes, setShowFieldTypes] = useState(true);
@@ -415,6 +417,7 @@ function QueryResultTableImpl({
     setSelectedRowIdxs(new Set());
     setSelectedColumns(new Set());
     columnSelectionAnchorRef.current = null;
+    rowSelectionAnchorRef.current = null;
     onSelectedCellChange?.(null);
     onSelectedRowsChange?.([]);
     setEditingCell(null);
@@ -426,6 +429,7 @@ function QueryResultTableImpl({
     setSelectedRowIdxs(new Set());
     setSelectedColumns(new Set());
     columnSelectionAnchorRef.current = null;
+    rowSelectionAnchorRef.current = null;
     onSelectedCellChange?.(null);
     onSelectedRowsChange?.([]);
     setEditingCell(null);
@@ -438,6 +442,7 @@ function QueryResultTableImpl({
     setSelectedRowIdxs(new Set());
     setSelectedColumns(new Set());
     columnSelectionAnchorRef.current = null;
+    rowSelectionAnchorRef.current = null;
     setEditingCell(cellKey(focusCellRequest.rowIdx, focusCellRequest.col));
     onSelectedCellChange?.({ rowIdx: focusCellRequest.rowIdx, col: focusCellRequest.col });
     onSelectedRowsChange?.([]);
@@ -490,21 +495,31 @@ function QueryResultTableImpl({
       return size;
     },
   });
+  const gridColumnCount = displayColumns.length + (showRowNumber ? 1 : 0);
+  const allRowsSelected = sortedIndices.length > 0 && sortedIndices.every((i) => selectedRowIdxs.has(i));
   const virtualRows = rowVirtualizer.getVirtualItems();
   const totalRowSize = rowVirtualizer.getTotalSize();
   const paddingTop = virtualRows.length > 0 ? virtualRows[0].start : 0;
   const paddingBottom = virtualRows.length > 0 ? totalRowSize - virtualRows[virtualRows.length - 1].end : 0;
 
+  // 行号列宽随页内最大行号增长,否则深翻页(offset + 页内序号)会被 `truncate` 裁掉。
+  const rowNumberWidth = useMemo(() => {
+    if (!showRowNumber) return 0;
+    const largest = rowNumberOffset + Math.max(sortedIndices.length, 1);
+    return Math.max(ROW_NUMBER_MIN_WIDTH, ROW_NUMBER_PADDING + String(largest).length * ROW_NUMBER_CHAR_WIDTH);
+  }, [rowNumberOffset, showRowNumber, sortedIndices.length]);
+
   const frozenColumnOffsets = useMemo(() => {
     const offsets: Record<string, number> = {};
-    let left = 0;
+    // 冻结列停在行号列右侧,而不是容器左沿 —— 否则第一列会盖住行号。
+    let left = rowNumberWidth;
     for (const col of displayColumns) {
       if (!frozenColumns.has(col)) break;
       offsets[col] = left;
       left += colWidths[col] ?? DEFAULT_COLUMN_WIDTH;
     }
     return offsets;
-  }, [colWidths, displayColumns, frozenColumns]);
+  }, [colWidths, displayColumns, frozenColumns, rowNumberWidth]);
 
   // Sorting is enabled whenever we have an onSortChange callback (server-side)
   // or when we're in read-only mode (local client-side sort on the current page).
@@ -940,25 +955,87 @@ function QueryResultTableImpl({
     setFilterSubOpen(false);
   }, [onClearFilterSort]);
 
-  const handleDeleteRow = useCallback(() => {
-    if (!ctxMenu || ctxMenu.kind === "column") return;
-    onDeleteRow?.(ctxMenu.rowIdx);
-    setCtxMenu(null);
-  }, [ctxMenu, onDeleteRow]);
+  // 右键落在选中集内 → 删整集(按显示顺序);落在集外 → 只删右键那一行。
+  const contextRowIdxs = useMemo(() => {
+    if (!ctxMenu || ctxMenu.kind === "column") return [];
+    if (selectedRowIdxs.has(ctxMenu.rowIdx)) {
+      const inSelection = sortedIndices.filter((i) => selectedRowIdxs.has(i));
+      if (inSelection.length > 0) return inSelection;
+    }
+    return [ctxMenu.rowIdx];
+  }, [ctxMenu, selectedRowIdxs, sortedIndices]);
 
-  // 清空时复用同一个空 Set:普通的"点另一个单元格"不该让行选中状态换标识。
-  // 一旦换了,依赖它的 handleCellContextMenu 也换标识,memo 化的单元格全部失效,
-  // 每点一下就重渲染整屏 —— 正是要消掉的那笔开销。
+  const handleDeleteRows = useCallback(() => {
+    if (contextRowIdxs.length === 0) return;
+    onDeleteRows?.(contextRowIdxs);
+    setCtxMenu(null);
+  }, [contextRowIdxs, onDeleteRows]);
+
   const selectCell = useCallback(
     (origIdx: number, col: string) => {
       setSelectedCell({ origIdx, col });
-      setSelectedRowIdxs((prev) => (prev.size === 0 ? prev : EMPTY_ROW_SELECTION));
+      setSelectedRowIdxs(new Set());
+      rowSelectionAnchorRef.current = null;
       onSelectedCellChange?.({ rowIdx: origIdx, col });
       onSelectedRowsChange?.([]);
       containerRef.current?.focus();
     },
     [onSelectedCellChange, onSelectedRowsChange]
   );
+
+  // 行选择:与 selectColumn 同一套语义 —— 单击设定、Ctrl/Cmd 切换、Shift 从锚点取区间。
+  // 区间按 sortedIndices(当前显示顺序)取,所以排序后 Shift 选的是屏幕上连续的一段。
+  const selectRow = useCallback(
+    (origIdx: number, event?: Pick<React.MouseEvent, "ctrlKey" | "metaKey" | "shiftKey">) => {
+      const anchor = rowSelectionAnchorRef.current;
+      const isRange = !!event?.shiftKey && anchor != null;
+      const isToggle = !!event?.ctrlKey || !!event?.metaKey;
+      let next: Set<number>;
+
+      if (isRange) {
+        const anchorIdx = sortedIndices.indexOf(anchor);
+        const targetIdx = sortedIndices.indexOf(origIdx);
+        if (anchorIdx === -1 || targetIdx === -1) {
+          next = new Set([origIdx]);
+        } else {
+          const start = Math.min(anchorIdx, targetIdx);
+          const end = Math.max(anchorIdx, targetIdx);
+          next = new Set(sortedIndices.slice(start, end + 1));
+        }
+      } else if (isToggle) {
+        next = new Set(selectedRowIdxs);
+        if (next.has(origIdx)) next.delete(origIdx);
+        else next.add(origIdx);
+        rowSelectionAnchorRef.current = origIdx;
+      } else {
+        next = new Set([origIdx]);
+        rowSelectionAnchorRef.current = origIdx;
+      }
+
+      setSelectedCell(null);
+      setSelectedColumns(new Set());
+      columnSelectionAnchorRef.current = null;
+      setSelectedRowIdxs(next);
+      onSelectedCellChange?.(null);
+      onSelectedRowsChange?.(sortedIndices.filter((i) => next.has(i)));
+      containerRef.current?.focus();
+    },
+    [onSelectedCellChange, onSelectedRowsChange, selectedRowIdxs, sortedIndices]
+  );
+
+  const toggleSelectAllRows = useCallback(() => {
+    const allSelected = sortedIndices.length > 0 && sortedIndices.every((i) => selectedRowIdxs.has(i));
+    const next = allSelected ? [] : sortedIndices;
+
+    setSelectedCell(null);
+    setSelectedColumns(new Set());
+    columnSelectionAnchorRef.current = null;
+    rowSelectionAnchorRef.current = next.length > 0 ? next[0] : null;
+    setSelectedRowIdxs(new Set(next));
+    onSelectedCellChange?.(null);
+    onSelectedRowsChange?.([...next]);
+    containerRef.current?.focus();
+  }, [onSelectedCellChange, onSelectedRowsChange, selectedRowIdxs, sortedIndices]);
 
   const selectColumn = useCallback(
     (col: string, event?: Pick<React.MouseEvent, "ctrlKey" | "metaKey" | "shiftKey">) => {
@@ -993,6 +1070,7 @@ function QueryResultTableImpl({
 
       setSelectedCell(null);
       setSelectedRowIdxs(new Set());
+      rowSelectionAnchorRef.current = null;
       setSelectedColumns(next);
       onSelectedCellChange?.(null);
       onSelectedRowsChange?.([]);
@@ -1001,31 +1079,18 @@ function QueryResultTableImpl({
     [displayColumns, onSelectedCellChange, onSelectedRowsChange, selectedColumns]
   );
 
-  // handleCellContextMenu 会传给 memo 化的 ResultCell,必须是稳定引用。它只是"读一下
-  // 当前选中集合来决定分支",所以走 ref 镜像而不是进依赖数组 —— 否则每次改选中都会
-  // 换标识,把整屏单元格的 memo 全部打掉。右键只可能发生在 effect 冲洗之后,不会读到旧值。
-  const selectedRowIdxsRef = useRef(selectedRowIdxs);
-  const selectedColumnsRef = useRef(selectedColumns);
-  useEffect(() => {
-    selectedRowIdxsRef.current = selectedRowIdxs;
-  }, [selectedRowIdxs]);
-  useEffect(() => {
-    selectedColumnsRef.current = selectedColumns;
-  }, [selectedColumns]);
-
   const handleCellContextMenu = useCallback(
     (e: React.MouseEvent, origIdx: number, col: string, value: unknown) => {
       e.preventDefault();
       e.stopPropagation();
-      const selectedRowIdxsNow = selectedRowIdxsRef.current;
-      const selectedColumnsNow = selectedColumnsRef.current;
-      if (selectedRowIdxsNow.has(origIdx) || selectedColumnsNow.has(col)) {
+      if (selectedRowIdxs.has(origIdx) || selectedColumns.has(col)) {
         setSelectedCell({ origIdx, col });
-        if (!selectedRowIdxsNow.has(origIdx)) {
-          setSelectedRowIdxs(EMPTY_ROW_SELECTION);
+        if (!selectedRowIdxs.has(origIdx)) {
+          setSelectedRowIdxs(new Set());
+          rowSelectionAnchorRef.current = null;
           onSelectedRowsChange?.([]);
         }
-        if (!selectedColumnsNow.has(col)) {
+        if (!selectedColumns.has(col)) {
           setSelectedColumns(new Set());
           columnSelectionAnchorRef.current = null;
         }
@@ -1037,7 +1102,19 @@ function QueryResultTableImpl({
       setCtxMenuPosition(null);
       setCtxMenu({ kind: "cell", x: e.clientX, y: e.clientY, rowIdx: origIdx, col, value });
     },
-    [onSelectedCellChange, onSelectedRowsChange, selectCell]
+    [onSelectedCellChange, onSelectedRowsChange, selectCell, selectedRowIdxs, selectedColumns]
+  );
+
+  const handleRowContextMenu = useCallback(
+    (e: React.MouseEvent, origIdx: number) => {
+      e.preventDefault();
+      e.stopPropagation();
+      // 右键落在选中集外时先重置为单选该行,与 handleCellContextMenu 同语义。
+      if (!selectedRowIdxs.has(origIdx)) selectRow(origIdx);
+      setCtxMenuPosition(null);
+      setCtxMenu({ kind: "row", x: e.clientX, y: e.clientY, rowIdx: origIdx });
+    },
+    [selectRow, selectedRowIdxs]
   );
 
   const handleColumnContextMenu = useCallback(
@@ -1078,11 +1155,6 @@ function QueryResultTableImpl({
     [selectCell]
   );
 
-  // ResultCell 是 memo 化的,传给它的回调必须是稳定引用,否则 memo 每次都失效。
-  const handleStartEdit = useCallback((ck: string) => setEditingCell(ck), []);
-  const handleCancelEdit = useCallback(() => setEditingCell(null), []);
-  const openDateEditorLabel = t("query.openDateTimePicker");
-
   // Arrow key navigation + Enter/F2 to edit + Escape to deselect/cancel
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLDivElement>) => {
@@ -1095,6 +1167,7 @@ function QueryResultTableImpl({
           setSelectedRowIdxs(new Set());
           setSelectedColumns(new Set());
           columnSelectionAnchorRef.current = null;
+          rowSelectionAnchorRef.current = null;
           onSelectedCellChange?.(null);
           onSelectedRowsChange?.([]);
         }
@@ -1248,6 +1321,25 @@ function QueryResultTableImpl({
         <table className="border-separate border-spacing-0 text-xs font-mono">
           <thead className="bg-muted sticky top-0">
             <tr>
+              {showRowNumber && (
+                <th
+                  data-row-header-all
+                  title={t("query.selectAllRows")}
+                  onClick={toggleSelectAllRows}
+                  className={`sticky left-0 z-40 border border-border px-2 ${headerPaddingClass} text-center align-middle font-semibold whitespace-nowrap select-none cursor-pointer ${
+                    allRowsSelected
+                      ? "query-table-frozen-header-selected text-foreground ring-2 ring-inset ring-primary/50"
+                      : "bg-muted text-muted-foreground hover:text-foreground"
+                  }`}
+                  style={{
+                    width: `${rowNumberWidth}px`,
+                    minWidth: `${rowNumberWidth}px`,
+                    maxWidth: `${rowNumberWidth}px`,
+                  }}
+                >
+                  #
+                </th>
+              )}
               {displayColumns.map((col) => {
                 const isSorted = sortCol === col;
                 const width = colWidths[col] ?? DEFAULT_COLUMN_WIDTH;
@@ -1384,7 +1476,7 @@ function QueryResultTableImpl({
           <tbody>
             {paddingTop > 0 && (
               <tr aria-hidden="true">
-                <td colSpan={displayColumns.length} style={{ height: paddingTop, padding: 0, border: 0 }} />
+                <td colSpan={gridColumnCount} style={{ height: paddingTop, padding: 0, border: 0 }} />
               </tr>
             )}
             {virtualRows.map((virtualRow) => {
@@ -1400,37 +1492,123 @@ function QueryResultTableImpl({
                   ref={rowVirtualizer.measureElement}
                   className={idx % 2 === 0 ? "bg-background" : "bg-muted/40"}
                 >
+                  {showRowNumber && (
+                    <td
+                      data-row-header-key={origIdx}
+                      data-row-selected={isRowSelected ? "true" : undefined}
+                      onClick={(e) => selectRow(origIdx, e)}
+                      onContextMenu={(e) => handleRowContextMenu(e, origIdx)}
+                      className={`sticky left-0 z-20 border border-border px-2 ${cellPaddingClass} text-center align-middle whitespace-nowrap select-none cursor-pointer ${
+                        isRowSelected
+                          ? "query-table-frozen-header-selected text-foreground"
+                          : "bg-muted text-muted-foreground hover:text-foreground"
+                      }`}
+                      style={{
+                        width: `${rowNumberWidth}px`,
+                        minWidth: `${rowNumberWidth}px`,
+                        maxWidth: `${rowNumberWidth}px`,
+                      }}
+                    >
+                      {rowNumberOffset + idx + 1}
+                    </td>
+                  )}
                   {displayColumns.map((col) => {
                     const ck = cellKey(origIdx, col);
-                    const isEdited = !!edits?.has(ck);
+                    const isEdited = edits?.has(ck);
+                    const displayValue = isEdited ? edits!.get(ck) : row[col];
+                    const isEditing = editingCell === ck;
+                    const isSelected = selectedCell?.origIdx === origIdx && selectedCell?.col === col;
+                    const width = colWidths[col] ?? DEFAULT_COLUMN_WIDTH;
+                    const frozenLeft = frozenColumnOffsets[col];
+                    const isFrozen = frozenLeft != null;
+                    const dateModeForCell = getDateEditMode(col, columnTypes?.[col], displayValue);
+                    const showDateAction =
+                      editable && isSelected && !isEditing && !!dateModeForCell && !!setCellValueHandler;
+
+                    const focusPositionClass = isFrozen ? "z-20" : "relative z-10";
+                    const editedBgClass = isFrozen ? "query-table-frozen-cell-edited" : "bg-warning/15";
+                    const selectedBgClass = isFrozen ? "query-table-frozen-cell-selected" : "bg-primary/15";
+                    const editingBgClass = isFrozen ? "query-table-frozen-cell-focus" : "bg-primary/5";
+                    const focusClass = isEditing
+                      ? `ring-2 ring-inset ring-primary ${editingBgClass} ${focusPositionClass}`
+                      : isSelected
+                        ? `ring-2 ring-inset ring-primary/60 ${focusPositionClass}`
+                        : "";
+
                     return (
-                      <ResultCell
+                      <td
                         key={col}
-                        cellKeyStr={ck}
-                        origIdx={origIdx}
-                        col={col}
-                        value={isEdited ? edits!.get(ck) : row[col]}
-                        columnType={columnTypes?.[col]}
-                        isEdited={isEdited}
-                        isEditing={editingCell === ck}
-                        isSelected={selectedCell?.origIdx === origIdx && selectedCell?.col === col}
-                        isRowSelected={isRowSelected}
-                        isColumnSelected={selectedColumns.has(col)}
-                        width={colWidths[col] ?? DEFAULT_COLUMN_WIDTH}
-                        frozenLeft={frozenColumnOffsets[col]}
-                        paddingClass={cellPaddingClass}
-                        editable={!!editable}
-                        canSetCellValue={canSetCellValue}
-                        renderCell={renderCell}
-                        inputRef={inputRef}
-                        openDateEditorLabel={openDateEditorLabel}
-                        onSelect={handleCellClick}
-                        onStartEdit={handleStartEdit}
-                        onContextMenu={handleCellContextMenu}
-                        onCommitEdit={commitEdit}
-                        onCancelEdit={handleCancelEdit}
-                        onOpenDateEditor={handleOpenDateEditorForCell}
-                      />
+                        data-cell-key={ck}
+                        data-row-selected={isRowSelected ? "true" : undefined}
+                        data-column-selected={selectedColumns.has(col) ? col : undefined}
+                        className={`border border-border px-2 ${cellPaddingClass} whitespace-nowrap cursor-default ${
+                          isEdited
+                            ? editedBgClass
+                            : isRowSelected || selectedColumns.has(col)
+                              ? selectedBgClass
+                              : isFrozen
+                                ? "bg-background"
+                                : ""
+                        } ${isFrozen ? "sticky z-10" : ""} ${focusClass}`}
+                        style={{
+                          width: `${width}px`,
+                          minWidth: `${width}px`,
+                          maxWidth: `${width}px`,
+                          ...(isFrozen ? { left: `${frozenLeft}px` } : {}),
+                        }}
+                        title={displayValue == null ? "NULL" : cellValueToDisplayText(displayValue)}
+                        onClick={() => handleCellClick(origIdx, col)}
+                        onDoubleClick={() => {
+                          if (!editable) return;
+                          setEditingCell(ck);
+                        }}
+                        onContextMenu={(e) => handleCellContextMenu(e, origIdx, col, displayValue)}
+                      >
+                        {isEditing ? (
+                          <input
+                            ref={inputRef}
+                            className="w-full bg-transparent outline-none border-none p-0 m-0 text-xs font-mono"
+                            defaultValue={cellValueToText(displayValue)}
+                            onBlur={(e) => commitEdit(origIdx, col, e.target.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter") {
+                                // IME 合成中：让 Enter 作为候选词确认，不提交编辑
+
+                                if (e.nativeEvent.isComposing || e.keyCode === 229) return;
+                                commitEdit(origIdx, col, (e.target as HTMLInputElement).value);
+                              }
+                              if (e.key === "Escape") {
+                                setEditingCell(null);
+                              }
+                            }}
+                          />
+                        ) : (
+                          <div className="flex min-w-0 items-center gap-1">
+                            <div className="min-w-0 flex-1">
+                              {renderCell ? (
+                                renderCell(displayValue, { rowIdx: origIdx, col })
+                              ) : displayValue == null ? (
+                                <span className="text-muted-foreground italic">NULL</span>
+                              ) : (
+                                <span className="truncate block">{cellValueToDisplayText(displayValue)}</span>
+                              )}
+                            </div>
+                            {showDateAction && (
+                              <button
+                                type="button"
+                                className="flex h-6 w-7 shrink-0 items-center justify-center rounded bg-primary text-primary-foreground hover:bg-primary/90"
+                                title={t("query.openDateTimePicker")}
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  handleOpenDateEditorForCell(origIdx, col, displayValue, event);
+                                }}
+                              >
+                                <MoreHorizontal className="h-4 w-4" />
+                              </button>
+                            )}
+                          </div>
+                        )}
+                      </td>
                     );
                   })}
                 </tr>
@@ -1438,7 +1616,7 @@ function QueryResultTableImpl({
             })}
             {paddingBottom > 0 && (
               <tr aria-hidden="true">
-                <td colSpan={displayColumns.length} style={{ height: paddingBottom, padding: 0, border: 0 }} />
+                <td colSpan={gridColumnCount} style={{ height: paddingBottom, padding: 0, border: 0 }} />
               </tr>
             )}
           </tbody>
@@ -1837,15 +2015,17 @@ function QueryResultTableImpl({
                     {t("query.refreshTable")}
                   </button>
                 )}
-                {ctxMenu.kind !== "column" && editable && onDeleteRow && (
+                {ctxMenu.kind !== "column" && editable && onDeleteRows && (
                   <button
                     type="button"
                     role="menuitem"
                     className={`${CONTEXT_MENU_ITEM_CLASS} text-destructive hover:text-destructive`}
-                    onClick={handleDeleteRow}
+                    onClick={handleDeleteRows}
                   >
                     <Trash2 className="h-3.5 w-3.5" />
-                    {t("query.deleteRecord")}
+                    {contextRowIdxs.length > 1
+                      ? t("query.deleteRecords", { count: contextRowIdxs.length })
+                      : t("query.deleteRecord")}
                   </button>
                 )}
               </>
@@ -1972,146 +2152,6 @@ interface ColumnValuePanelProps {
   selected: Set<string> | null;
   onChange: (next: Set<string> | null) => void;
 }
-
-interface ResultCellProps {
-  cellKeyStr: string;
-  origIdx: number;
-  col: string;
-  value: unknown;
-  columnType?: string;
-  isEdited: boolean;
-  isEditing: boolean;
-  isSelected: boolean;
-  isRowSelected: boolean;
-  isColumnSelected: boolean;
-  width: number;
-  frozenLeft?: number;
-  paddingClass: string;
-  editable: boolean;
-  canSetCellValue: boolean;
-  renderCell?: (value: unknown, ctx: RenderCellContext) => React.ReactNode;
-  inputRef: React.RefObject<HTMLInputElement | null>;
-  openDateEditorLabel: string;
-  onSelect: (origIdx: number, col: string) => void;
-  onStartEdit: (cellKeyStr: string) => void;
-  onContextMenu: (e: React.MouseEvent, origIdx: number, col: string, value: unknown) => void;
-  onCommitEdit: (origIdx: number, col: string, value: string) => void;
-  onCancelEdit: () => void;
-  onOpenDateEditor: (origIdx: number, col: string, value: unknown, event: React.MouseEvent) => void;
-}
-
-// 单元格独立 memo:选中态是表级 state,改一次会让整个 <tbody> 重跑。以前 40 行 × 25 列
-// 就是一次点击重建 1000 个 <td>(实测点击到反馈 p50 144ms);memo 之后只有"失去选中"和
-// "获得选中"这两个格子真正重渲染。className 拼接、getDateEditMode、cellValueToDisplayText
-// 也一并搬进来,让它们只在该格子真的变了时才算。
-const ResultCell = memo(function ResultCell({
-  cellKeyStr,
-  origIdx,
-  col,
-  value,
-  columnType,
-  isEdited,
-  isEditing,
-  isSelected,
-  isRowSelected,
-  isColumnSelected,
-  width,
-  frozenLeft,
-  paddingClass,
-  editable,
-  canSetCellValue,
-  renderCell,
-  inputRef,
-  openDateEditorLabel,
-  onSelect,
-  onStartEdit,
-  onContextMenu,
-  onCommitEdit,
-  onCancelEdit,
-  onOpenDateEditor,
-}: ResultCellProps) {
-  const isFrozen = frozenLeft != null;
-  const dateMode = getDateEditMode(col, columnType, value);
-  const showDateAction = editable && isSelected && !isEditing && !!dateMode && canSetCellValue;
-
-  const focusPositionClass = isFrozen ? "z-20" : "relative z-10";
-  const editedBgClass = isFrozen ? "query-table-frozen-cell-edited" : "bg-warning/15";
-  const selectedBgClass = isFrozen ? "query-table-frozen-cell-selected" : "bg-primary/15";
-  const editingBgClass = isFrozen ? "query-table-frozen-cell-focus" : "bg-primary/5";
-  const focusClass = isEditing
-    ? `ring-2 ring-inset ring-primary ${editingBgClass} ${focusPositionClass}`
-    : isSelected
-      ? `ring-2 ring-inset ring-primary/60 ${focusPositionClass}`
-      : "";
-
-  return (
-    <td
-      data-cell-key={cellKeyStr}
-      data-row-selected={isRowSelected ? "true" : undefined}
-      data-column-selected={isColumnSelected ? col : undefined}
-      className={`border border-border px-2 ${paddingClass} whitespace-nowrap cursor-default ${
-        isEdited ? editedBgClass : isRowSelected || isColumnSelected ? selectedBgClass : isFrozen ? "bg-background" : ""
-      } ${isFrozen ? "sticky z-10" : ""} ${focusClass}`}
-      style={{
-        width: `${width}px`,
-        minWidth: `${width}px`,
-        maxWidth: `${width}px`,
-        ...(isFrozen ? { left: `${frozenLeft}px` } : {}),
-      }}
-      title={value == null ? "NULL" : cellValueToDisplayText(value)}
-      onClick={() => onSelect(origIdx, col)}
-      onDoubleClick={() => {
-        if (!editable) return;
-        onStartEdit(cellKeyStr);
-      }}
-      onContextMenu={(e) => onContextMenu(e, origIdx, col, value)}
-    >
-      {isEditing ? (
-        <input
-          ref={inputRef}
-          className="w-full bg-transparent outline-none border-none p-0 m-0 text-xs font-mono"
-          defaultValue={cellValueToText(value)}
-          onBlur={(e) => onCommitEdit(origIdx, col, e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") {
-              // IME 合成中:让 Enter 作为候选词确认,不提交编辑
-              if (e.nativeEvent.isComposing || e.keyCode === 229) return;
-              onCommitEdit(origIdx, col, (e.target as HTMLInputElement).value);
-            }
-            if (e.key === "Escape") {
-              onCancelEdit();
-            }
-          }}
-        />
-      ) : (
-        <div className="flex min-w-0 items-center gap-1">
-          <div className="min-w-0 flex-1">
-            {renderCell ? (
-              renderCell(value, { rowIdx: origIdx, col })
-            ) : value == null ? (
-              <span className="text-muted-foreground italic">NULL</span>
-            ) : (
-              <span className="truncate block">{cellValueToDisplayText(value)}</span>
-            )}
-          </div>
-          {showDateAction && (
-            <button
-              type="button"
-              className="flex h-6 w-7 shrink-0 items-center justify-center rounded bg-primary text-primary-foreground hover:bg-primary/90"
-              title={openDateEditorLabel}
-              onClick={(event) => {
-                event.stopPropagation();
-                onOpenDateEditor(origIdx, col, value, event);
-              }}
-            >
-              <MoreHorizontal className="h-4 w-4" />
-            </button>
-          )}
-        </div>
-      )}
-    </td>
-  );
-});
 
 function ColumnValuePanel({ col, entries, selected, onChange }: ColumnValuePanelProps) {
   const { t } = useTranslation();
